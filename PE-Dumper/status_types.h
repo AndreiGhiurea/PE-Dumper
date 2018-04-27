@@ -2,6 +2,13 @@
 #include <stdio.h>
 #include <windows.h>
 
+extern CRITICAL_SECTION ListCriticalSection;
+extern PLIST_ENTRY FileList;
+extern HANDLE NewItemEvent;
+extern HANDLE NoMoreFilesEvent;
+extern HANDLE EndEvent;
+
+
 // #ifndef BOOLEAN
 // typedef unsigned __int8 BOOLEAN, *PBOOLEAN;
 // #endif

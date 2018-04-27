@@ -1,14 +1,65 @@
 #include "status_types.h"
-#include <time.h>
+#include "list.h"
 
-DWORD FileSizeGlobal = 0;
+STATUS DumpExe(LPSTR SrcPath, DWORD FileSize, LPSTR DestPath);
 
-STATUS OpenFileForDump(WIN32_FIND_DATA File, HANDLE *hIn)
+DWORD NrFilesProcessed = 0;
+
+DWORD WINAPI ListScanThreadFunction(
+	_In_ LPVOID lpParameter)
 {
-	FileSizeGlobal = File.nFileSizeLow;
+	UNREFERENCED_PARAMETER(lpParameter);
 
+	DWORD EventResult;
+	PLIST_ENTRY ListEntryDump = NULL;
+	PLIST_ITEM ListItemDump = NULL;
+	PLIST_ITEM_PARAM ListItemParam = NULL;
+	HANDLE  EventList[3];
+	EventList[0] = NewItemEvent;
+	EventList[2] = NoMoreFilesEvent;
+	EventList[1] = EndEvent;
+
+	while (TRUE)
+	{
+		EventResult = WaitForMultipleObjects(3, EventList, FALSE, INFINITE);
+		if (WAIT_FAILED == EventResult)
+		{
+			PRINT_ERROR("WaitForMultipleObjects failed\n");
+			break;
+		}
+
+		// Exit event
+		if (EventResult - WAIT_OBJECT_0 == 1)
+		{
+			goto end;
+		}
+
+		EnterCriticalSection(&ListCriticalSection);				
+		if (IsListEmpty(FileList))
+		{
+			LeaveCriticalSection(&ListCriticalSection);
+			goto end;
+		}
+		ListEntryDump = RemoveHeadList(FileList);
+		NrFilesProcessed++;
+		LeaveCriticalSection(&ListCriticalSection);
+
+		ListItemDump = CONTAINING_RECORD(ListEntryDump, LIST_ITEM, ListEntry);
+		ListItemParam = ListItemDump->Parameter;
+		DumpExe(ListItemParam->SrcPath, ListItemParam->FileSize, ListItemParam->DestPath);
+
+		free(ListItemParam);
+		free(ListItemDump);
+	}
+
+	end:
+	return STATUS_SUCCESS;
+}
+
+STATUS OpenFileForDump(LPSTR SrcPath, HANDLE *hIn)
+{
 	*hIn = CreateFile(
-		File.cFileName,
+		SrcPath,
 		GENERIC_READ,
 		0,
 		NULL,
@@ -65,7 +116,7 @@ STATUS MapViewForDump(HANDLE hMap, PIMAGE_DOS_HEADER *MappedFile)
 	return STATUS_SUCCESS;
 }
 
-DWORD RvaToVa(PIMAGE_SECTION_HEADER SectionHeader, DWORD RVA, WORD NumberOfSections)
+DWORD RvaToVa(PIMAGE_SECTION_HEADER SectionHeader, DWORD RVA, WORD NumberOfSections, DWORD FileSize)
 {	
 	if (!RVA)
 	{
@@ -78,7 +129,7 @@ DWORD RvaToVa(PIMAGE_SECTION_HEADER SectionHeader, DWORD RVA, WORD NumberOfSecti
 			if (RVA >= SectionHeader[Section].VirtualAddress && RVA <= (SectionHeader[Section].VirtualAddress + SectionHeader[Section].SizeOfRawData))
 			{
 				DWORD VA = SectionHeader[Section].PointerToRawData + (RVA - SectionHeader[Section].VirtualAddress);
-				if (VA >= FileSizeGlobal)
+				if (VA >= FileSize)
 				{
 					return 0;
 				}
@@ -90,259 +141,259 @@ DWORD RvaToVa(PIMAGE_SECTION_HEADER SectionHeader, DWORD RVA, WORD NumberOfSecti
 	return 0;
 }
 
-STATUS PrintDumperHeader(LPSTR Filename)
+STATUS PrintDumperHeader(LPSTR Filename, FILE* LogFile)
 {
-	printf("***********Dump of file info***********\n");
-	printf("* Dumping: %s\n", Filename);
+	fprintf(LogFile, "***********Dump of file info***********\n");
+	fprintf(LogFile, "* Dumping: %s\n", Filename);
 
 	return STATUS_SUCCESS;
 }
 
-STATUS CheckDos(PIMAGE_DOS_HEADER DosHeader)
+STATUS CheckDos(PIMAGE_DOS_HEADER DosHeader, FILE* LogFile)
 {
 	if (DosHeader->e_magic != IMAGE_DOS_SIGNATURE)
 	{
-		printf("DOS Header e_magic invalid!\n");
+		fprintf(LogFile, "DOS Header e_magic invalid!\n");
 		return STATUS_UNSUCCESSFUL;
 	}
 
 	return STATUS_SUCCESS;
 }
 
-STATUS CheckPe(PIMAGE_DOS_HEADER DosHeader, PIMAGE_NT_HEADERS NtHeader)
+STATUS CheckPe(PIMAGE_DOS_HEADER DosHeader, PIMAGE_NT_HEADERS NtHeader, DWORD FileSize, FILE* LogFile)
 {
-	if (FileSizeGlobal <= (DWORD)DosHeader->e_lfanew)
+	if (FileSize <= (DWORD)DosHeader->e_lfanew)
 	{
-		printf("No NT Header, it's probably an MS-DOS file, not a PE!\n");
+		fprintf(LogFile, "No NT Header, it's probably an MS-DOS file, not a PE!\n");
 		return STATUS_UNSUCCESSFUL;
 	}
 
 	if (NtHeader->Signature != IMAGE_NT_SIGNATURE)
 	{
-		printf("NT Header signature invalid!\n");
+		fprintf(LogFile, "NT Header signature invalid!\n");
 		return STATUS_UNSUCCESSFUL;
 	}
 
 	return STATUS_SUCCESS;
 }
 
-STATUS IsI386(PIMAGE_FILE_HEADER FileHeader)
+STATUS IsI386(PIMAGE_FILE_HEADER FileHeader, FILE* LogFile)
 {
 	if (FileHeader->Machine != IMAGE_FILE_MACHINE_I386)
 	{
-		printf("Not a x86 exe!\n");
+		fprintf(LogFile, "Not a x86 exe!\n");
 		return STATUS_UNSUCCESSFUL;
 	}
 
 	return STATUS_SUCCESS;
 }
 
-STATUS PrintDosHeaderInfo(PIMAGE_DOS_HEADER DosHeader)
+STATUS PrintDosHeaderInfo(PIMAGE_DOS_HEADER DosHeader, FILE* LogFile)
 {
-	printf("* DOS Header e_magic: %x (MZ)\n", DosHeader->e_magic);
-	printf("* DOS Header e_lfanew: %x\n", DosHeader->e_lfanew);
+	fprintf(LogFile, "* DOS Header e_magic: %x (MZ)\n", DosHeader->e_magic);
+	fprintf(LogFile, "* DOS Header e_lfanew: %x\n", DosHeader->e_lfanew);
 
 	return STATUS_SUCCESS;
 }
 
-STATUS PrintNtHeaderInfo(PIMAGE_NT_HEADERS NtHeader)
+STATUS PrintNtHeaderInfo(PIMAGE_NT_HEADERS NtHeader, FILE* LogFile)
 {
-	printf("* NT Header Signature: %x (PE)\n", NtHeader->Signature);
-	printf("***************************************\n");
+	fprintf(LogFile, "* NT Header Signature: %x (PE)\n", NtHeader->Signature);
+	fprintf(LogFile, "***************************************\n");
 
 	return STATUS_SUCCESS;
 }
 
-STATUS PrintFileHeaderInfo(PIMAGE_FILE_HEADER FileHeader)
+STATUS PrintFileHeaderInfo(PIMAGE_FILE_HEADER FileHeader, FILE* LogFile)
 {
-	printf("FILE HEADER\n");
-	printf("   Machine: %x (Intel 386)\n", FileHeader->Machine);
-	printf("   NumberOfSections: %x\n", FileHeader->NumberOfSections);
-	printf("   TimeDateStamp: %x\n", FileHeader->TimeDateStamp);
-	printf("   PointerToSymbolTable: %x\n", FileHeader->PointerToSymbolTable);
-	printf("   NumberOfSymbols: %x\n", FileHeader->NumberOfSymbols);
-	printf("   SizeOfOptionalHeader: %x\n", FileHeader->SizeOfOptionalHeader);
-	printf("   Characteristics: %x\n", FileHeader->Characteristics);
+	fprintf(LogFile, "FILE HEADER\n");
+	fprintf(LogFile, "   Machine: %x (Intel 386)\n", FileHeader->Machine);
+	fprintf(LogFile, "   NumberOfSections: %x\n", FileHeader->NumberOfSections);
+	fprintf(LogFile, "   TimeDateStamp: %x\n", FileHeader->TimeDateStamp);
+	fprintf(LogFile, "   PointerToSymbolTable: %x\n", FileHeader->PointerToSymbolTable);
+	fprintf(LogFile, "   NumberOfSymbols: %x\n", FileHeader->NumberOfSymbols);
+	fprintf(LogFile, "   SizeOfOptionalHeader: %x\n", FileHeader->SizeOfOptionalHeader);
+	fprintf(LogFile, "   Characteristics: %x\n", FileHeader->Characteristics);
 
 	WORD Characteristics = FileHeader->Characteristics;
 	if (IMAGE_FILE_DLL & Characteristics)
 	{
-		printf("       %s\n", "File is a DLL");
+		fprintf(LogFile, "       %s\n", "File is a DLL");
 		Characteristics &= ~IMAGE_FILE_DLL;
 	}
 	if (IMAGE_FILE_SYSTEM & Characteristics)
 	{
-		printf("       %s\n", "System File");
+		fprintf(LogFile, "       %s\n", "System File");
 		Characteristics &= ~IMAGE_FILE_SYSTEM;
 	}
 	if (IMAGE_FILE_32BIT_MACHINE & Characteristics)
 	{
-		printf("       %s\n", "32 bit word machine");
+		fprintf(LogFile, "       %s\n", "32 bit word machine");
 		Characteristics &= ~IMAGE_FILE_32BIT_MACHINE;
 	}
 	if (IMAGE_FILE_EXECUTABLE_IMAGE & Characteristics)
 	{
-		printf("       %s\n", "File is executable");
+		fprintf(LogFile, "       %s\n", "File is executable");
 		Characteristics &= ~IMAGE_FILE_EXECUTABLE_IMAGE;
 	}
 	if (Characteristics)
 	{
-		printf("       %s\n", "+ Others");
+		fprintf(LogFile, "       %s\n", "+ Others");
 	}
-	printf("\n");
+	fprintf(LogFile, "\n");
 
 	return STATUS_SUCCESS;
 }
 
-STATUS PrintOptionalHeaderInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader)
+STATUS PrintOptionalHeaderInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, FILE* LogFile)
 {
-	printf("OPTIONAL HEADER\n");
-	printf("   Magic: %x (PE32)\n", OptionalHeader->Magic);
-	printf("   SizeOfCode: %x\n", OptionalHeader->SizeOfCode);
-	printf("   SizeOfInitializedData: %x\n", OptionalHeader->SizeOfInitializedData);
-	printf("   SizeOfUninitializedData: %x\n", OptionalHeader->SizeOfUninitializedData);
-	printf("   AdressOfEntryPoint: %x\n", OptionalHeader->AddressOfEntryPoint);
-	printf("   BaseOfCode: %x\n", OptionalHeader->BaseOfCode); 
-	printf("   BaseOfData: %x\n", OptionalHeader->BaseOfData);
-	printf("   ImageBase: %x\n", OptionalHeader->ImageBase);
-	printf("   SectionAlignment: %x\n", OptionalHeader->SectionAlignment);
-	printf("   FileAlignment: %x\n", OptionalHeader->FileAlignment);
-	printf("   Win32Version: %x\n", OptionalHeader->Win32VersionValue);
-	printf("   SizeOfImage: %x\n", OptionalHeader->SizeOfImage);
-	printf("   SizeOfHeaders: %x\n", OptionalHeader->SizeOfHeaders);
-	printf("   CheckSum: %x\n", OptionalHeader->CheckSum);
-	printf("   Subsystem %x ", OptionalHeader->Subsystem);
+	fprintf(LogFile, "OPTIONAL HEADER\n");
+	fprintf(LogFile, "   Magic: %x (PE32)\n", OptionalHeader->Magic);
+	fprintf(LogFile, "   SizeOfCode: %x\n", OptionalHeader->SizeOfCode);
+	fprintf(LogFile, "   SizeOfInitializedData: %x\n", OptionalHeader->SizeOfInitializedData);
+	fprintf(LogFile, "   SizeOfUninitializedData: %x\n", OptionalHeader->SizeOfUninitializedData);
+	fprintf(LogFile, "   AdressOfEntryPoint: %x\n", OptionalHeader->AddressOfEntryPoint);
+	fprintf(LogFile, "   BaseOfCode: %x\n", OptionalHeader->BaseOfCode); 
+	fprintf(LogFile, "   BaseOfData: %x\n", OptionalHeader->BaseOfData);
+	fprintf(LogFile, "   ImageBase: %x\n", OptionalHeader->ImageBase);
+	fprintf(LogFile, "   SectionAlignment: %x\n", OptionalHeader->SectionAlignment);
+	fprintf(LogFile, "   FileAlignment: %x\n", OptionalHeader->FileAlignment);
+	fprintf(LogFile, "   Win32Version: %x\n", OptionalHeader->Win32VersionValue);
+	fprintf(LogFile, "   SizeOfImage: %x\n", OptionalHeader->SizeOfImage);
+	fprintf(LogFile, "   SizeOfHeaders: %x\n", OptionalHeader->SizeOfHeaders);
+	fprintf(LogFile, "   CheckSum: %x\n", OptionalHeader->CheckSum);
+	fprintf(LogFile, "   Subsystem %x ", OptionalHeader->Subsystem);
 
 	if (IMAGE_SUBSYSTEM_WINDOWS_GUI == OptionalHeader->Subsystem)
 	{
-		printf("(Windows GUI)\n");
+		fprintf(LogFile, "(Windows GUI)\n");
 	}
 	else if (IMAGE_SUBSYSTEM_WINDOWS_CUI == OptionalHeader->Subsystem)
 	{
-		printf("(Windows CUI)\n");
+		fprintf(LogFile, "(Windows CUI)\n");
 	}
 	else if (IMAGE_SUBSYSTEM_NATIVE == OptionalHeader->Subsystem)
 	{
-		printf("(Native)\n");
+		fprintf(LogFile, "(Native)\n");
 	}
 	
-	printf("   DllCharacteristics: %x\n", OptionalHeader->DllCharacteristics);
-	printf("   SizeOfStackReserve: %x\n", OptionalHeader->SizeOfStackReserve);
-	printf("   SizeOfStackCommit: %x\n", OptionalHeader->SizeOfStackCommit);
-	printf("   SizeOfHeapReserve: %x\n", OptionalHeader->SizeOfHeapReserve);
-	printf("   SizeOfHeapCommit: %x\n", OptionalHeader->SizeOfHeapCommit);
-	printf("   LoaderFlags: %x\n", OptionalHeader->LoaderFlags);
-	printf("   NumberOfRvaAndSizes: %x\n", OptionalHeader->NumberOfRvaAndSizes);
+	fprintf(LogFile, "   DllCharacteristics: %x\n", OptionalHeader->DllCharacteristics);
+	fprintf(LogFile, "   SizeOfStackReserve: %x\n", OptionalHeader->SizeOfStackReserve);
+	fprintf(LogFile, "   SizeOfStackCommit: %x\n", OptionalHeader->SizeOfStackCommit);
+	fprintf(LogFile, "   SizeOfHeapReserve: %x\n", OptionalHeader->SizeOfHeapReserve);
+	fprintf(LogFile, "   SizeOfHeapCommit: %x\n", OptionalHeader->SizeOfHeapCommit);
+	fprintf(LogFile, "   LoaderFlags: %x\n", OptionalHeader->LoaderFlags);
+	fprintf(LogFile, "   NumberOfRvaAndSizes: %x\n", OptionalHeader->NumberOfRvaAndSizes);
 	
-	printf("       Export Directory RVA: %x\n       Export Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size);
-	printf("       Import Directory RVA: %x\n       Import Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size);
-	printf("       Resource Directory RVA: %x\n       Resource Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].Size);
-	printf("       Exception Directory RVA: %x\n       Exception Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size);
-	printf("       Security Directory RVA: %x\n       Security Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size);
-	printf("       Relocation Directory RVA: %x\n       Relocation Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size);
-	printf("       Debug Directory RVA: %x\n       Debug Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size);
-	printf("       Architecture Directory RVA: %x\n       Architecture Directory: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_ARCHITECTURE].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_ARCHITECTURE].Size);
-	printf("       TLS Directory RVA: %x\n       TLS Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size);
-	printf("       Configuration Directory RVA: %x\n       Configuration Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size);
-	printf("       Bound Import Directory RVA: %x\n       Bound Import Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].Size);
-	printf("       Import Address Table Directory RVA: %x\n       Import Address Table Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size);
-	printf("       Delay Import Directory RVA: %x\n       Delay Import Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size);
-	printf("\n");
+	fprintf(LogFile, "       Export Directory RVA: %x\n       Export Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size);
+	fprintf(LogFile, "       Import Directory RVA: %x\n       Import Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size);
+	fprintf(LogFile, "       Resource Directory RVA: %x\n       Resource Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].Size);
+	fprintf(LogFile, "       Exception Directory RVA: %x\n       Exception Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size);
+	fprintf(LogFile, "       Security Directory RVA: %x\n       Security Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size);
+	fprintf(LogFile, "       Relocation Directory RVA: %x\n       Relocation Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size);
+	fprintf(LogFile, "       Debug Directory RVA: %x\n       Debug Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size);
+	fprintf(LogFile, "       Architecture Directory RVA: %x\n       Architecture Directory: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_ARCHITECTURE].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_ARCHITECTURE].Size);
+	fprintf(LogFile, "       TLS Directory RVA: %x\n       TLS Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size);
+	fprintf(LogFile, "       Configuration Directory RVA: %x\n       Configuration Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size);
+	fprintf(LogFile, "       Bound Import Directory RVA: %x\n       Bound Import Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].Size);
+	fprintf(LogFile, "       Import Address Table Directory RVA: %x\n       Import Address Table Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size);
+	fprintf(LogFile, "       Delay Import Directory RVA: %x\n       Delay Import Directory Size: %x\n", OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress, OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size);
+	fprintf(LogFile, "\n");
 
 	return STATUS_SUCCESS;
 }
 
-STATUS PrintSectionHeader(WORD Section, PIMAGE_SECTION_HEADER SectionHeader, PIMAGE_DOS_HEADER DosHeader)
+STATUS PrintSectionHeader(WORD Section, PIMAGE_SECTION_HEADER SectionHeader, PIMAGE_DOS_HEADER DosHeader, DWORD FileSize, FILE* LogFile)
 {
-	printf("SECTION HEADER #%d\n", Section + 1);
+	fprintf(LogFile, "SECTION HEADER #%d\n", Section + 1);
 
-	DWORD Remaining = FileSizeGlobal - ((PDWORD)SectionHeader - (PDWORD)DosHeader);
+	DWORD Remaining = FileSize - ((PDWORD)SectionHeader - (PDWORD)DosHeader);
 	if (sizeof(IMAGE_SECTION_HEADER)*Section > Remaining)
 	{
-		printf("   Section out of file!\n");
+		fprintf(LogFile, "   Section out of file!\n");
 		return STATUS_UNSUCCESSFUL;
 	}
 
 	CHAR NameOfSection[255];
 	if (strlen((char*)SectionHeader[Section].Name) > 8)
 	{
-		printf("   Invalid section name!\n");
+		fprintf(LogFile, "   Invalid section name!\n");
 	}
 	else
 	{
 		strcpy_s(NameOfSection, strlen((char*)SectionHeader[Section].Name) + 1, (char*)SectionHeader[Section].Name);
 	}
 
-	printf("   NameOfSection: %s\n", NameOfSection);
-	printf("   VirtualSize: %x\n", SectionHeader[Section].Misc.VirtualSize);
-	printf("   SizeOfRawData: %x\n", SectionHeader[Section].SizeOfRawData);
-	printf("   PointerToRelocations: %x\n", SectionHeader[Section].PointerToRelocations);
-	printf("   PointerToLineNumbers: %x\n", SectionHeader[Section].PointerToLinenumbers);
-	printf("   NumberOfRelocation: %x\n", SectionHeader[Section].NumberOfRelocations);
-	printf("   NumberOfLinenumbers: %x\n", SectionHeader[Section].NumberOfLinenumbers);
-	printf("   Characteristics: %x\n", SectionHeader[Section].Characteristics);
+	fprintf(LogFile, "   NameOfSection: %s\n", NameOfSection);
+	fprintf(LogFile, "   VirtualSize: %x\n", SectionHeader[Section].Misc.VirtualSize);
+	fprintf(LogFile, "   SizeOfRawData: %x\n", SectionHeader[Section].SizeOfRawData);
+	fprintf(LogFile, "   PointerToRelocations: %x\n", SectionHeader[Section].PointerToRelocations);
+	fprintf(LogFile, "   PointerToLineNumbers: %x\n", SectionHeader[Section].PointerToLinenumbers);
+	fprintf(LogFile, "   NumberOfRelocation: %x\n", SectionHeader[Section].NumberOfRelocations);
+	fprintf(LogFile, "   NumberOfLinenumbers: %x\n", SectionHeader[Section].NumberOfLinenumbers);
+	fprintf(LogFile, "   Characteristics: %x\n", SectionHeader[Section].Characteristics);
 
 	DWORD Characteristics = SectionHeader[Section].Characteristics;
 	if (IMAGE_SCN_CNT_CODE & Characteristics)
 	{
-		printf("   The section contains executable code.\n");
+		fprintf(LogFile, "   The section contains executable code.\n");
 	}
 	if (IMAGE_SCN_CNT_INITIALIZED_DATA & Characteristics)
 	{
-		printf("   The section contains initialized data.\n");
+		fprintf(LogFile, "   The section contains initialized data.\n");
 	}
 	if (IMAGE_SCN_CNT_UNINITIALIZED_DATA & Characteristics)
 	{
-		printf("   The section contains uninitialized data.\n");
+		fprintf(LogFile, "   The section contains uninitialized data.\n");
 	}
 	if (IMAGE_SCN_LNK_INFO & Characteristics)
 	{
-		printf("   The section contains comments or other information.\n");
+		fprintf(LogFile, "   The section contains comments or other information.\n");
 	}
 	if (IMAGE_SCN_MEM_SHARED & Characteristics)
 	{
-		printf("   The section can be shared in memory.\n");
+		fprintf(LogFile, "   The section can be shared in memory.\n");
 	}
 	if (IMAGE_SCN_MEM_EXECUTE & Characteristics)
 	{
-		printf("   The section can be executed as code.\n");
+		fprintf(LogFile, "   The section can be executed as code.\n");
 	}
 	if (IMAGE_SCN_MEM_READ & Characteristics)
 	{
-		printf("   The section can be read.\n");
+		fprintf(LogFile, "   The section can be read.\n");
 	}
 	if (IMAGE_SCN_MEM_WRITE & Characteristics)
 	{
-		printf("   The section can be written to.\n");
+		fprintf(LogFile, "   The section can be written to.\n");
 	}
 
-	printf("\n");
+	fprintf(LogFile, "\n");
 
 	return STATUS_SUCCESS;
 }
 
-STATUS PrintImportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEADER SectionHeader, WORD NumberOfSections, PIMAGE_DOS_HEADER DosHeader)
+STATUS PrintImportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEADER SectionHeader, WORD NumberOfSections, PIMAGE_DOS_HEADER DosHeader, DWORD FileSize, FILE* LogFile)
 {
 	if (OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size == 0 || !OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress)
 	{
-		printf("No imports\n\n");
+		fprintf(LogFile, "No imports\n\n");
 		return STATUS_UNSUCCESSFUL;
 	}
 
 	DWORD ImportDescriptorRVA = OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-	DWORD ImportDescriptorVA = RvaToVa(SectionHeader, ImportDescriptorRVA, NumberOfSections);
+	DWORD ImportDescriptorVA = RvaToVa(SectionHeader, ImportDescriptorRVA, NumberOfSections, FileSize);
 	if (!ImportDescriptorVA)
 	{
 		return STATUS_INVALID_RVA;
 	}
 	PIMAGE_IMPORT_DESCRIPTOR ImportDescriptor = (PIMAGE_IMPORT_DESCRIPTOR)((DWORD)DosHeader + ImportDescriptorVA);
 
-	printf("IMPORTS\n");
+	fprintf(LogFile, "IMPORTS\n");
 
 	while (ImportDescriptor->Characteristics)
 	{
 		DWORD NameRVA = ImportDescriptor->Name;
-		DWORD NameVA = RvaToVa(SectionHeader, NameRVA, NumberOfSections);
+		DWORD NameVA = RvaToVa(SectionHeader, NameRVA, NumberOfSections, FileSize);
 
 		PDWORD Name;
 		if (!NameVA)
@@ -354,12 +405,12 @@ STATUS PrintImportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEA
 			Name = (PDWORD)(NameVA + (DWORD)DosHeader);
 		}
 
-		printf("   %s\n", (PCHAR)Name);
-		printf("       Charatesritics: %x\n", ImportDescriptor->Characteristics);
-		printf("       FirstThunkRVA: %x\n", ImportDescriptor->FirstThunk);
-		printf("       OriginalFirstThunkRVA: %x\n", ImportDescriptor->OriginalFirstThunk);
-		// Time is 0 until image is bound; printf("       Time: %x\n", ImportDescriptor->TimeDateStamp);
-		// printf("       ForwarderChain: %x\n", ImportDescriptor->ForwarderChain);
+		fprintf(LogFile, "   %s\n", (PCHAR)Name);
+		fprintf(LogFile, "       Charatesritics: %x\n", ImportDescriptor->Characteristics);
+		fprintf(LogFile, "       FirstThunkRVA: %x\n", ImportDescriptor->FirstThunk);
+		fprintf(LogFile, "       OriginalFirstThunkRVA: %x\n", ImportDescriptor->OriginalFirstThunk);
+		// Time is 0 until image is bound; fprintf(LogFile, "       Time: %x\n", ImportDescriptor->TimeDateStamp);
+		// fprintf(LogFile, "       ForwarderChain: %x\n", ImportDescriptor->ForwarderChain);
 
 		DWORD ImportLookupTableRVA;
 		if (ImportDescriptor->OriginalFirstThunk)
@@ -371,51 +422,51 @@ STATUS PrintImportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEA
 			ImportLookupTableRVA = ImportDescriptor->FirstThunk;
 		}
 		//DWORD ImportLookupTableRVA = ImportDescriptor->OriginalFirstThunk; // ->Characteristics
-		DWORD ImportLookupTableVA = RvaToVa(SectionHeader, ImportLookupTableRVA, NumberOfSections);
+		DWORD ImportLookupTableVA = RvaToVa(SectionHeader, ImportLookupTableRVA, NumberOfSections, FileSize);
 		if (!ImportLookupTableVA)
 		{
 			return STATUS_INVALID_RVA;
 		}
 		PIMAGE_THUNK_DATA ImportLookupTable = (PIMAGE_THUNK_DATA)(ImportLookupTableVA + (DWORD)DosHeader);
 
-		printf("\n       Imported Functions\n");
+		fprintf(LogFile, "\n       Imported Functions\n");
 		while (ImportLookupTable->u1.AddressOfData)
 		{
 			if (IMAGE_SNAP_BY_ORDINAL(ImportLookupTable->u1.Ordinal))
 			{
-				printf("          Imported by ordinal: %x\n", ImportLookupTable->u1.Ordinal); // Imported by ordinal
+				fprintf(LogFile, "          Imported by ordinal: %x\n", ImportLookupTable->u1.Ordinal); // Imported by ordinal
 			}
 			else
 			{
 				DWORD ImportByNameRVA = ImportLookupTable->u1.AddressOfData;
-				DWORD ImportByNameVA = RvaToVa(SectionHeader, ImportByNameRVA, NumberOfSections);
+				DWORD ImportByNameVA = RvaToVa(SectionHeader, ImportByNameRVA, NumberOfSections, FileSize);
 				if (!ImportByNameVA)
 				{
 					return STATUS_INVALID_RVA;
 				}
 				PIMAGE_IMPORT_BY_NAME ImportByName = (PIMAGE_IMPORT_BY_NAME)(ImportByNameVA + (DWORD)DosHeader);
 
-				printf("          %x %s\n", ImportByName->Hint, ImportByName->Name);
+				fprintf(LogFile, "          %x %s\n", ImportByName->Hint, ImportByName->Name);
 			}
 			ImportLookupTable++;
 		}
 		ImportDescriptor++;
-		printf("\n");
+		fprintf(LogFile, "\n");
 	}
 
 	return STATUS_SUCCESS;
 }
 
-STATUS PrintExportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEADER SectionHeader, WORD NumberOfSections, PIMAGE_DOS_HEADER DosHeader)
+STATUS PrintExportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEADER SectionHeader, WORD NumberOfSections, PIMAGE_DOS_HEADER DosHeader, DWORD FileSize, FILE* LogFile)
 {
 	if (OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size == 0 || IMAGE_DIRECTORY_ENTRY_EXPORT >= OptionalHeader->NumberOfRvaAndSizes || !OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress)
 	{
-		printf("No exports\n\n");
+		fprintf(LogFile, "No exports\n\n");
 		return STATUS_UNSUCCESSFUL;
 	}
 
 	DWORD ExportDirectoryRVA = OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-	DWORD ExportDirectoryVA = RvaToVa(SectionHeader, ExportDirectoryRVA, NumberOfSections);
+	DWORD ExportDirectoryVA = RvaToVa(SectionHeader, ExportDirectoryRVA, NumberOfSections, FileSize);
 	if (!ExportDirectoryVA)
 	{
 		return STATUS_INVALID_RVA;
@@ -423,7 +474,7 @@ STATUS PrintExportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEA
 	PIMAGE_EXPORT_DIRECTORY ExportDirectory = (PIMAGE_EXPORT_DIRECTORY)(ExportDirectoryVA + (DWORD)DosHeader);
 
 	DWORD NameRVA = ExportDirectory->Name;
-	DWORD NameVA = RvaToVa(SectionHeader, NameRVA, NumberOfSections);
+	DWORD NameVA = RvaToVa(SectionHeader, NameRVA, NumberOfSections, FileSize);
 	PDWORD Name;
 	if (!NameVA)
 	{
@@ -434,16 +485,16 @@ STATUS PrintExportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEA
 		Name = (PDWORD)(NameVA + (DWORD)DosHeader);
 	}
 	
-	printf("EXPORTS\n");
-	printf("   Name: %s\n", (char*)Name);
-	printf("   Characteristics: %x\n", ExportDirectory->Characteristics);
-	printf("   Time: %x\n", ExportDirectory->TimeDateStamp);
-	printf("   Base: %x\n", ExportDirectory->Base);
-	printf("   NumberOfFunctions: %x\n", ExportDirectory->NumberOfFunctions);
-	printf("   NumberOfNames: %x\n", ExportDirectory->NumberOfNames);
+	fprintf(LogFile, "EXPORTS\n");
+	fprintf(LogFile, "   Name: %s\n", (char*)Name);
+	fprintf(LogFile, "   Characteristics: %x\n", ExportDirectory->Characteristics);
+	fprintf(LogFile, "   Time: %x\n", ExportDirectory->TimeDateStamp);
+	fprintf(LogFile, "   Base: %x\n", ExportDirectory->Base);
+	fprintf(LogFile, "   NumberOfFunctions: %x\n", ExportDirectory->NumberOfFunctions);
+	fprintf(LogFile, "   NumberOfNames: %x\n", ExportDirectory->NumberOfNames);
 
 	DWORD AdressOfFunctionsRVA = ExportDirectory->AddressOfFunctions;
-	DWORD AdressOfFunctionsVA = RvaToVa(SectionHeader, AdressOfFunctionsRVA, NumberOfSections);
+	DWORD AdressOfFunctionsVA = RvaToVa(SectionHeader, AdressOfFunctionsRVA, NumberOfSections, FileSize);
 	if (!AdressOfFunctionsVA)
 	{
 		return STATUS_INVALID_RVA;
@@ -451,7 +502,7 @@ STATUS PrintExportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEA
 	PDWORD AdressOfFunctions = (PDWORD)(AdressOfFunctionsVA + (DWORD)DosHeader);
 
 	DWORD AdressOfNamesRVA = ExportDirectory->AddressOfNames;
-	DWORD AdressOfNamesVA = RvaToVa(SectionHeader, AdressOfNamesRVA, NumberOfSections);
+	DWORD AdressOfNamesVA = RvaToVa(SectionHeader, AdressOfNamesRVA, NumberOfSections, FileSize);
 	if (!AdressOfNamesVA)
 	{
 		return STATUS_INVALID_RVA;
@@ -459,14 +510,14 @@ STATUS PrintExportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEA
 	PDWORD AdressOfNames = (PDWORD)(AdressOfNamesVA + (DWORD)DosHeader);
 
 	DWORD AdressOfNameOrdinalsRVA = ExportDirectory->AddressOfNameOrdinals;
-	DWORD AdressOfNameOrdinalsVA = RvaToVa(SectionHeader, AdressOfNameOrdinalsRVA, NumberOfSections);
+	DWORD AdressOfNameOrdinalsVA = RvaToVa(SectionHeader, AdressOfNameOrdinalsRVA, NumberOfSections, FileSize);
 	if (!AdressOfNameOrdinalsVA)
 	{
 		return STATUS_INVALID_RVA;
 	}
 	PWORD AdressOfNameOrdinals = (PWORD)(AdressOfNameOrdinalsVA + (DWORD)DosHeader);
 
-	printf("\n   Exported Functions By Name\n");
+	fprintf(LogFile, "\n   Exported Functions By Name\n");
 	for (DWORD i = 0; i < ExportDirectory->NumberOfNames; i++)
 	{
 	//	if (AdressOfFunctions[AdressOfNameOrdinals[i]] < OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress 
@@ -476,7 +527,7 @@ STATUS PrintExportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEA
 		
 		// Both exported and forwarded functions
 		DWORD FunNameRVA = AdressOfNames[i];
-		DWORD FunNameVA = RvaToVa(SectionHeader, FunNameRVA, NumberOfSections);
+		DWORD FunNameVA = RvaToVa(SectionHeader, FunNameRVA, NumberOfSections, FileSize);
 
 		PDWORD FunName;
 		if (!FunNameVA)
@@ -489,14 +540,14 @@ STATUS PrintExportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEA
 		}
 		
 
-		printf("       %s", (char*)FunName);
-		printf(" %x", AdressOfNameOrdinals[i] + ExportDirectory->Base);
+		fprintf(LogFile, "       %s", (char*)FunName);
+		fprintf(LogFile, " %x", AdressOfNameOrdinals[i] + ExportDirectory->Base);
 		DWORD FunctionRVA = AdressOfFunctions[AdressOfNameOrdinals[i]];
-		printf(" %x\n", FunctionRVA);
+		fprintf(LogFile, " %x\n", FunctionRVA);
 	//	}
 	}
 
-	printf("\n   Exported Functions By Ordinal\n");
+	fprintf(LogFile, "\n   Exported Functions By Ordinal\n");
 	for (DWORD i = 0; i < ExportDirectory->NumberOfFunctions; i++)
 	{
 		if (AdressOfFunctions[i])
@@ -511,8 +562,8 @@ STATUS PrintExportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEA
 			}
 			if (j >= ExportDirectory->NumberOfNames)
 			{
-				printf("       %s", "No name");
-				printf(" %x\n", i + ExportDirectory->Base);
+				fprintf(LogFile, "       %s", "No name");
+				fprintf(LogFile, " %x\n", i + ExportDirectory->Base);
 			}
 		}
 	}
@@ -520,13 +571,16 @@ STATUS PrintExportInfo(PIMAGE_OPTIONAL_HEADER OptionalHeader, PIMAGE_SECTION_HEA
 	return STATUS_SUCCESS;
 }
 
-STATUS DumpExe(WIN32_FIND_DATA File)
+STATUS DumpExe(LPSTR SrcPath, DWORD FileSize, LPSTR DestPath)
 {
+	UNREFERENCED_PARAMETER(DestPath);
+
+	FILE* LogFile = NULL;
 	HANDLE hIn = INVALID_HANDLE_VALUE;
 	HANDLE hMap = NULL;
 	PIMAGE_DOS_HEADER DosHeader = NULL;
 
-	if (!SUCCESS(OpenFileForDump(File, &hIn)))
+	if (!SUCCESS(OpenFileForDump(SrcPath, &hIn)))
 	{
 		PRINT_ERROR("CreateFile failed");
 		goto cleanup;
@@ -535,6 +589,10 @@ STATUS DumpExe(WIN32_FIND_DATA File)
 	if (!SUCCESS(MapFileForDump(hIn, &hMap)))
 	{
 		PRINT_ERROR("CreateFileMapping failed");
+		if (GetLastError() == 1006)
+		{
+			printf("Cannot map an empty file!\n");
+		}
 		goto cleanup;
 	}
 
@@ -544,50 +602,57 @@ STATUS DumpExe(WIN32_FIND_DATA File)
 		goto cleanup;
 	}
 
-	PrintDumperHeader(File.cFileName);
+	fopen_s(&LogFile, DestPath, "w");
+	if (NULL == LogFile)
+	{
+		PRINT_ERROR("fopen failed");
+		return STATUS_UNSUCCESSFUL;
+	}
 
-	if (!SUCCESS(CheckDos(DosHeader)))
+	PrintDumperHeader(SrcPath, LogFile);
+
+	if (!SUCCESS(CheckDos(DosHeader, LogFile)))
 	{
 		goto cleanup;
 	}
 
-	PrintDosHeaderInfo(DosHeader);
+	PrintDosHeaderInfo(DosHeader, LogFile);
 
 	PIMAGE_NT_HEADERS NtHeader = (PIMAGE_NT_HEADERS)((PBYTE)DosHeader + DosHeader->e_lfanew);
 
-	if (!SUCCESS(CheckPe(DosHeader, NtHeader)))
+	if (!SUCCESS(CheckPe(DosHeader, NtHeader, FileSize, LogFile)))
 	{
 		goto cleanup;
 	}
 
-	PrintNtHeaderInfo(NtHeader);
+	PrintNtHeaderInfo(NtHeader, LogFile);
 
 	PIMAGE_FILE_HEADER FileHeader = &NtHeader->FileHeader;
 
-	if (!SUCCESS(IsI386(FileHeader)))
+	if (!SUCCESS(IsI386(FileHeader, LogFile)))
 	{
 		goto cleanup;
 	}
 
-	if (File.nFileSizeLow <= (DWORD)FileHeader->SizeOfOptionalHeader)
+	if (FileSize <= (DWORD)FileHeader->SizeOfOptionalHeader)
 	{
-		printf("Invalid optional header!\n");
+		fprintf(LogFile, "Invalid optional header!\n");
 		goto cleanup;
 	}
 
 	PIMAGE_OPTIONAL_HEADER OptionalHeader = &NtHeader->OptionalHeader;
 	PIMAGE_SECTION_HEADER SectionHeader = (PIMAGE_SECTION_HEADER)((PBYTE)OptionalHeader + FileHeader->SizeOfOptionalHeader);
 
-	PrintFileHeaderInfo(FileHeader);
-	PrintOptionalHeaderInfo(OptionalHeader);
+	PrintFileHeaderInfo(FileHeader, LogFile);
+	PrintOptionalHeaderInfo(OptionalHeader, LogFile);
 
 	for (WORD Section = 0; Section < FileHeader->NumberOfSections; Section++)
 	{
-		PrintSectionHeader(Section, SectionHeader, DosHeader);
+		PrintSectionHeader(Section, SectionHeader, DosHeader, FileSize, LogFile);
 	}
 
-	PrintImportInfo(OptionalHeader, SectionHeader, FileHeader->NumberOfSections, DosHeader);
-	PrintExportInfo(OptionalHeader, SectionHeader, FileHeader->NumberOfSections, DosHeader);
+	PrintImportInfo(OptionalHeader, SectionHeader, FileHeader->NumberOfSections, DosHeader, FileSize, LogFile);
+	PrintExportInfo(OptionalHeader, SectionHeader, FileHeader->NumberOfSections, DosHeader, FileSize, LogFile);
 	
 cleanup:
 	if (hIn != INVALID_HANDLE_VALUE)
@@ -601,6 +666,10 @@ cleanup:
 	if (DosHeader != NULL)
 	{
 		UnmapViewOfFile(DosHeader); // Unmap view of file
+	}
+	if (LogFile != NULL)
+	{
+		fclose(LogFile);
 	}
 
 	return STATUS_SUCCESS;

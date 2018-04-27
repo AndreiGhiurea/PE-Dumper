@@ -123,6 +123,7 @@
     <ClCompile Include="pe.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="list.h" />
     <ClInclude Include="status_types.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
